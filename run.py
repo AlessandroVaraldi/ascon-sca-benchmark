@@ -453,12 +453,14 @@ def train_one_subkey(
     epochs: int = 50,
     lr: float = 1e-3,
     device: str = "cuda",
-) -> Tuple[int, List[float], List[float], List[float], List[float]]:
+) -> Tuple[int, int, float, List[float], List[float], List[float], List[float]]:
     """
     Train a single model on a single BitNum (3-bit subkey classification).
 
     Returns:
         best_recovered_subkey (int),
+        rank_true (int, in [1..8]),         # rank of the correct subkey in attack log-likelihoods
+        sr (float, 0.0 or 1.0),             # success indicator (1 if rank_true == 1)
         train_losses, val_losses, train_accs, val_accs
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -615,9 +617,20 @@ def train_one_subkey(
             log_probs = F.log_softmax(logits, dim=1)  # [B, C]
             log_likelihoods += log_probs.sum(dim=0).cpu().numpy()
 
+    # Most likely subkey (rank 1)
     best_recovered_subkey = int(np.argmax(log_likelihoods))
 
-    return best_recovered_subkey, train_losses, val_losses, train_accs, val_accs
+    # Guessing Entropy (rank of true subkey) and Success Rate indicator
+    # All fixed_keys traces share the same true subkey for this BitNum
+    true_subkey = int(labels_attack_subkeys[0])
+    # ranks: indices sorted by log-likelihood (descending)
+    ranks = np.argsort(log_likelihoods)[::-1]
+    # position of the true subkey in ranks (0-based) -> GE is 1-based
+    rank_true = int(np.where(ranks == true_subkey)[0][0]) + 1
+    sr = 1.0 if rank_true == 1 else 0.0
+
+    return best_recovered_subkey, rank_true, sr, train_losses, val_losses, train_accs, val_accs
+
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +704,8 @@ def main():
         os.makedirs(model_dir, exist_ok=True)
 
         recovered_subkeys_all = np.zeros(num_bitnums, dtype=np.int64)
+        ranks_all = np.zeros(num_bitnums, dtype=np.int64)
+        sr_all = np.zeros(num_bitnums, dtype=np.float64)
 
         print(f"\n========== Model: {model_name_clean.upper()} ==========")
 
@@ -718,7 +733,7 @@ def main():
             X_fixed_win = traces_fixed[:, start:end]    # [N_fixed, W]
 
             # Train and attack
-            best_subkey, train_losses, val_losses, train_accs, val_accs = train_one_subkey(
+            best_subkey, rank_true, sr, train_losses, val_losses, train_accs, val_accs = train_one_subkey(
                 model_name=model_name_clean,
                 loss_type=args.loss_type,
                 traces_train=X_random_win,
@@ -734,29 +749,45 @@ def main():
             )
 
             recovered_subkeys_all[bitnum] = best_subkey
-            print(f"[{model_name_clean.upper()}][BitNum {bitnum:02d}] Recovered subkey: {best_subkey}")
+            ranks_all[bitnum] = rank_true
+            sr_all[bitnum] = sr
+            print(
+                f"[{model_name_clean.upper()}][BitNum {bitnum:02d}] "
+                f"Recovered subkey: {best_subkey} | rank_true: {rank_true} | SR: {sr:.1f}"
+            )
 
         # ------------------------------------------------------------------
         # Reconstruct key bits from recovered subkeys and compare
         # ------------------------------------------------------------------
         recovered_key_bits64 = reconstruct_key_bits_from_subkeys(recovered_subkeys_all, bit_length=64)
 
-        # Similarity metrics
+        # Similarity metrics  on key bits
         correct_bits = (recovered_key_bits64 == true_key_bits64).sum()
         total_bits = 64
         similarity = correct_bits / total_bits
         hamming_distance = total_bits - correct_bits
 
-        print(f"\n[{model_name_clean.upper()}] Key-bit similarity: {similarity:.4f} "
-              f"({correct_bits}/{total_bits} bits correct). "
-              f"Hamming distance: {hamming_distance}")
+        # Guessing Entropy (GE) and Success Rate (SR) across all subkeys
+        ge_model = float(ranks_all.mean())   # average rank of the true subkey (1..8)
+        sr_model = float(sr_all.mean())      # fraction of subkeys with rank 1
+
+        print(
+            f"\n[{model_name_clean.upper()}] "
+            f"GE (avg rank over subkeys): {ge_model:.3f} | "
+            f"SR (subkey success rate): {sr_model:.3f} | "
+            f"Key-bit similarity: {similarity:.4f} ({correct_bits}/{total_bits} bits correct, "
+            f"Hamming distance: {hamming_distance})"
+        )
 
         # Save summary
         summary_path = os.path.join(model_dir, "summary.txt")
         with open(summary_path, "w") as f:
             f.write(f"Model: {model_name_clean.upper()}\n")
             f.write(f"Loss type: {args.loss_type}\n")
+            f.write(f"Guessing Entropy (avg rank over 64 subkeys): {ge_model:.6f}\n")
+            f.write(f"Success Rate (fraction of subkeys with rank 1): {sr_model:.6f}\n\n")
             f.write(f"Recovered subkeys (0..63):\n{recovered_subkeys_all.tolist()}\n\n")
+            f.write(f"Per-subkey ranks (1..8, true subkey rank):\n{ranks_all.tolist()}\n\n")
             f.write(f"True key (first 8 bytes): {true_key_bytes_fixed[:8].tolist()}\n")
             f.write(f"True key bits[0..63]: {true_key_bits64.tolist()}\n")
             f.write(f"Recovered key bits[0..63]: {recovered_key_bits64.tolist()}\n")
@@ -783,6 +814,8 @@ def main():
             "recovered_key_bits": recovered_key_bits64,
             "similarity": np.array([similarity]),
             "hamming_distance": np.array([hamming_distance]),
+            "ge": np.array([ge_model]),
+            "sr": np.array([sr_model]),
         }
 
     h5.close()
@@ -790,26 +823,39 @@ def main():
     # ----------------------------------------------------------------------
     # Final ranking of models by key-bit similarity
     # ----------------------------------------------------------------------
-    print("\n================ Final Model Ranking (by key-bit similarity) ================")
+    print("\n================ Final Model Ranking (by SR, GE, then key-bit similarity) ================")
     ranking = sorted(
         model_results.items(),
-        key=lambda kv: float(kv[1]["similarity"][0]),
-        reverse=True,
+        key=lambda kv: (
+            -float(kv[1]["sr"][0]),           # higher SR is better
+            float(kv[1]["ge"][0]),           # lower GE is better
+            -float(kv[1]["similarity"][0]),  # higher similarity is better
+        ),
     )
 
     for rank, (model_name, res) in enumerate(ranking, start=1):
         sim = float(res["similarity"][0])
         hd = int(res["hamming_distance"][0])
-        print(f"{rank}. {model_name.upper():>12} - similarity {sim:.4f}, Hamming distance {hd}")
+        ge = float(res["ge"][0])
+        sr = float(res["sr"][0])
+        print(
+            f"{rank}. {model_name.upper():>12} - "
+            f"SR {sr:.4f}, GE {ge:.4f}, similarity {sim:.4f}, Hamming distance {hd}"
+        )
 
     # Optionally save a global summary file
     global_summary_path = os.path.join(args.output_dir, "global_ranking.txt")
     with open(global_summary_path, "w") as f:
-        f.write("Model ranking by key-bit similarity (first 64 bits of key):\n\n")
+        f.write("Model ranking (SR, GE, key-bit similarity on first 64 bits of key):\n\n")
         for rank, (model_name, res) in enumerate(ranking, start=1):
             sim = float(res["similarity"][0])
             hd = int(res["hamming_distance"][0])
-            f.write(f"{rank}. {model_name.upper():>12} - similarity {sim:.6f}, Hamming distance {hd}\n")
+            ge = float(res["ge"][0])
+            sr = float(res["sr"][0])
+            f.write(
+                f"{rank}. {model_name.upper():>12} - "
+                f"SR {sr:.6f}, GE {ge:.6f}, similarity {sim:.6f}, Hamming distance {hd}\n"
+            )
 
 
 if __name__ == "__main__":
