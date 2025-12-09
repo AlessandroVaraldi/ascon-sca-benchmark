@@ -12,11 +12,11 @@
 source ~/.bashrc
 conda activate torch-gpu
 
-# Directory where you launched sbatch (must contain train_subkeys.py, models/, loss_functions/, etc.)
+# Directory where you launched sbatch (must contain run.py, models/, loss_functions/, etc.)
 PROJECT_DIR="$SLURM_SUBMIT_DIR"
 
 # Work directory on SCRATCH (fast local storage on the node)
-WORKDIR="$SCRATCH/ascon_subkeys_$SLURM_JOB_ID"
+WORKDIR="$SCRATCH/run_$SLURM_JOB_ID"
 mkdir -p "$WORKDIR"
 
 echo "SLURM_JOB_ID      = $SLURM_JOB_ID"
@@ -31,12 +31,12 @@ rsync -av "$PROJECT_DIR"/ "$WORKDIR"/
 cd "$WORKDIR"
 
 # Where to store results inside WORKDIR
-OUTPUT_DIR="$WORKDIR/ascon_subkeys_results"
+OUTPUT_DIR="$WORKDIR/run_outputs"
 mkdir -p "$OUTPUT_DIR"
 
 # Run the full 3-bit-subkey recovery pipeline
 # >>> Adjust --h5-path, --epochs, --window-size, etc. as needed <<<
-python3 train_subkeys.py \
+python3 run.py \
   --h5-path "$HOME/data/ascon_hw_unprotected.h5" \
   --output-dir "$OUTPUT_DIR" \
   --loss-type ranking \
@@ -46,7 +46,7 @@ python3 train_subkeys.py \
   --window-size 500
 
 # Results directory in the original project folder
-RESULTS_DIR="$PROJECT_DIR/results_ascon_subkeys"
+RESULTS_DIR="$PROJECT_DIR/run_results/job_$SLURM_JOB_ID"
 mkdir -p "$RESULTS_DIR"
 
 # Sync all logs, plots, summaries, etc. back to the project directory
