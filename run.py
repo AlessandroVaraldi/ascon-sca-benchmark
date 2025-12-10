@@ -586,24 +586,16 @@ def main():
     parser = argparse.ArgumentParser(description="3-bit subkey profiling & key recovery on ASCON traces.")
     parser.add_argument("--h5-path", type=str, required=True, help="Path to HDF5 traces file.")
     parser.add_argument("--output-dir", type=str, required=True, help="Base output directory.")
-    parser.add_argument("--loss-type", type=str, choices=["ce", "ranking"], default="ce",
-                        help="Loss function: 'ce' for CrossEntropy, 'ranking' for RankingLoss.")
-    parser.add_argument("--models", type=str, nargs="+",
-                        default=["mlp", "cnn", "tcn", "transformer"],
-                        help="List of models to run: mlp cnn tcn transformer.")
+    parser.add_argument("--loss-type", type=str, choices=["ce", "ranking"], default="ce", help="Loss function: 'ce' for CrossEntropy, 'ranking' for RankingLoss.")
+    parser.add_argument("--models", type=str, nargs="+", default=["mlp", "cnn", "tcn", "transformer"], help="List of models to run: mlp cnn tcn transformer.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs per subkey.")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size.")
     parser.add_argument("--window-size", type=int, default=500, help="Window size (number of samples).")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Override device (e.g. 'cpu', 'cuda', or 'xpu'). "
-             "If not set, prefer CUDA, then XPU, then CPU.",
-    )
+    parser.add_argument("--device", type=str, default=None, help="Override device (e.g. 'cpu', 'cuda', or 'xpu'). If not set, prefer CUDA, then XPU, then CPU.")
 
     args = parser.parse_args()
+    
     set_seed(args.seed)
 
     device = args.device
