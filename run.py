@@ -773,7 +773,7 @@ def main():
         model_results.items(),
         key=lambda kv: (
             -float(kv[1]["sr"][0]),          # higher SR is better
-            +float(kv[1]["ge"][0]),           # lower GE is better
+            +float(kv[1]["ge"][0]),          # lower GE is better
             -float(kv[1]["similarity"][0]),  # higher similarity is better
         ),
     )
