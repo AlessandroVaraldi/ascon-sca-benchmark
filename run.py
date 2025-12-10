@@ -1,58 +1,3 @@
-#!/usr/bin/env python3
-"""
-Training and key-recovery script on ASCON traces using 3-bit subkeys as labels.
-
-Models:
-    - Baseline MLP (defined here)
-    - CNN1D           (from models/cnn.py)
-    - TCN             (from models/tcn.py)
-    - TinyTransformer (from models/transformer.py)
-
-Main idea:
-    - Use "random_keys" group in the HDF5 file for profiling (training/validation).
-    - Use "fixed_keys" group for the attack (key recovery).
-    - For each subkey index (BitNum in [0..63]):
-        * Compute true 3-bit subkey label from metadata['key'] using ascon.select_subkey.
-        * Compute SNR over time based on those 8 classes.
-        * Select an "interesting" time window (centered on max SNR).
-        * Train model on that window (8-class classification).
-        * On fixed_keys, use the model's predictions to recover the most likely subkey.
-    - Reconstruct 64 key bits from the recovered subkeys (using bit 0 of each 3-bit subkey).
-    - Compare reconstructed key bits against the true key bits.
-    - Repeat for all models and rank them by key-bit similarity.
-
-Directory structure (under --output-dir):
-    <output_dir>/
-        model_MLP/
-            subkey_00/
-                snr.png
-                train_val_loss.png
-                train_val_acc.png
-            ...
-            summary.txt
-        model_CNN1D/
-            ...
-        model_TCN/
-            ...
-        model_TinyTransformer/
-            ...
-
-Usage (example):
-    python train_subkeys.py \
-        --h5-path ascon_unprotected.h5 \
-        --output-dir results_ascon \
-        --loss-type ce \
-        --models mlp cnn tcn transformer \
-        --epochs 50 \
-        --window-size 500
-
-Note:
-    - This script assumes unprotected traces, i.e. metadata['key'] already holds
-      the full key bytes (no share-combining needed).
-    - For protected traces, you would need to add combine_shares() using the
-      cw/hw utilities from ascon_helper and apply it to metadata['key'].
-"""
-
 import argparse
 import os
 import math
@@ -217,7 +162,7 @@ def compute_multi_class_snr(
 
     mu_global = mu_c.mean(axis=0)      # [T]
     snr_num = ((mu_c - mu_global) ** 2).mean(axis=0)  # Var of means
-    snr_den = var_c.mean(axis=0)                       # Mean of variances
+    snr_den = var_c.mean(axis=0)                      # Mean of variances
 
     snr = snr_num / (snr_den + 1e-12)
     return snr
@@ -506,7 +451,7 @@ def train_one_subkey(
     train_accs, val_accs = [], []
 
     for epoch in range(1, epochs + 1):
-        # ---- Train ----
+        # ---- Train (accuracy here is diagnostic only, attack metrics are GE/SR) ----
         model.train()
         running_loss = 0.0
         correct = 0
@@ -517,7 +462,7 @@ def train_one_subkey(
             y = y.to(device)          # [B]
 
             if model_name.lower() in ["cnn", "tcn", "transformer"]:
-                x_in = x.unsqueeze(1)  # [B,1,T]
+                x_in = x.unsqueeze(1) # [B,1,T]
             else:
                 x_in = x              # [B,T]
 
@@ -574,7 +519,7 @@ def train_one_subkey(
             f"Val loss {val_loss:.4f}, acc {val_acc:.4f}"
         )
 
-    # 5) Plot training curves
+    # 5) Plot training curves (for debugging / diagnostics)
     epochs_range = range(1, epochs + 1)
 
     plt.figure()
@@ -805,7 +750,7 @@ def main():
         plt.title(f"{model_name_clean.upper()} - True vs Recovered key bits")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(model_dir, "key_bits_true_vs_recovered.png"))
+        plt.savefig(os.path.join(model_dir, "true_vs_recovered.png"))
         plt.close()
 
         # Store results for final ranking
@@ -821,14 +766,14 @@ def main():
     h5.close()
 
     # ----------------------------------------------------------------------
-    # Final ranking of models by key-bit similarity
+    # Final ranking of models by SR, GE, then key-bit similarity
     # ----------------------------------------------------------------------
     print("\n================ Final Model Ranking (by SR, GE, then key-bit similarity) ================")
     ranking = sorted(
         model_results.items(),
         key=lambda kv: (
-            -float(kv[1]["sr"][0]),           # higher SR is better
-            float(kv[1]["ge"][0]),           # lower GE is better
+            -float(kv[1]["sr"][0]),          # higher SR is better
+            +float(kv[1]["ge"][0]),           # lower GE is better
             -float(kv[1]["similarity"][0]),  # higher similarity is better
         ),
     )
@@ -838,12 +783,9 @@ def main():
         hd = int(res["hamming_distance"][0])
         ge = float(res["ge"][0])
         sr = float(res["sr"][0])
-        print(
-            f"{rank}. {model_name.upper():>12} - "
-            f"SR {sr:.4f}, GE {ge:.4f}, similarity {sim:.4f}, Hamming distance {hd}"
-        )
+        print(f"{rank}. {model_name.upper():>12} - SR {sr:.4f}, GE {ge:.4f}, similarity {sim:.4f}, Hamming distance {hd}")
 
-    # Optionally save a global summary file
+    # Save a global summary file with SR, GE and key-bit similarity
     global_summary_path = os.path.join(args.output_dir, "global_ranking.txt")
     with open(global_summary_path, "w") as f:
         f.write("Model ranking (SR, GE, key-bit similarity on first 64 bits of key):\n\n")
@@ -852,10 +794,7 @@ def main():
             hd = int(res["hamming_distance"][0])
             ge = float(res["ge"][0])
             sr = float(res["sr"][0])
-            f.write(
-                f"{rank}. {model_name.upper():>12} - "
-                f"SR {sr:.6f}, GE {ge:.6f}, similarity {sim:.6f}, Hamming distance {hd}\n"
-            )
+            f.write(f"{rank}. {model_name.upper():>12} - SR {sr:.6f}, GE {ge:.6f}, similarity {sim:.6f}, Hamming distance {hd}\n")
 
 
 if __name__ == "__main__":
