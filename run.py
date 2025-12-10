@@ -595,14 +595,25 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size.")
     parser.add_argument("--window-size", type=int, default=500, help="Window size (number of samples).")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
-    parser.add_argument("--device", type=str, default=None, help="Override device (e.g. 'cpu' or 'cuda').")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Override device (e.g. 'cpu', 'cuda', or 'xpu'). "
+             "If not set, prefer CUDA, then XPU, then CPU.",
+    )
 
     args = parser.parse_args()
     set_seed(args.seed)
 
     device = args.device
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        else:
+            device = "cpu"
     print(f"Using device: {device}")
 
     # ----------------------------------------------------------------------
