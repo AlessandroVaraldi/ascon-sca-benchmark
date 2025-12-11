@@ -15,8 +15,10 @@ The pipeline:
 3. Trains one classifier per 3-bit subkey index (`BitNum` from 0 to 63).
 4. Uses a **multi-class SNR** to select an informative trace window per subkey.
 5. Recovers all 3-bit subkeys for the fixed key.
-6. Reconstructs the first 64 bits of the secret key using **all 3 bits** of each subkey and the known geometry of `select_subkey`.
-7. Compares recovered key bits to the true fixed key and **ranks the models**.
+6. Reconstructs the first 64 bits of the secret key using **all 3 bits** of each subkey and the known geometry of `select_subkey`.  
+   The reconstruction combines the information from all 3-bit subkeys at the **bit level**, using their aggregated log-likelihoods.
+7. Compares recovered key bits to the true fixed key and **ranks the models** using side-channel metrics (success rate, guessing entropy)
+   together with key-bit similarity.
 
 ---
 
@@ -159,20 +161,23 @@ For each model and for each subkey index `BitNum = 0..63`:
 
 5. **Key reconstruction (first 64 bits)**
 
-   * After all 64 subkeys are recovered, the script decodes each subkey into its 3 constituent bits.
-   * Uses the known structure of `ascon.select_subkey` to map these bits back to **key bit positions**.
-   * Each key bit appears in three different subkeys; a **majority vote** is used to obtain the final bit value.
+   * After all 64 subkeys are attacked, the script keeps the **aggregated log-likelihoods** over the 8 possible 3-bit values for each subkey.
+   * Using the known structure of `ascon.select_subkey`, each 3-bit subkey is viewed as a constraint on three key bits.
+   * For each key bit, the script combines the contributions of the three subkeys that contain it:
+     it sums (in the log-domain) the likelihoods of all subkey classes compatible with the hypothesis `k_j = 0`
+     and with `k_j = 1`, then decides using a log-likelihood ratio (bit-level probabilistic combination).
    * The resulting 64-bit vector is compared to the true key bits (derived from the first 8 key bytes).
 
 6. **Evaluation and ranking**
 
    * For each model:
 
-     * Computes similarity: `correct_bits / 64`
-     * Computes Hamming distance: `64 − correct_bits`
+     * Computes **Guessing Entropy (GE)** as the average rank of the correct 3-bit subkey over the 64 BitNum,
+     * Computes **Success Rate (SR)** as the fraction of subkeys where the correct 3-bit subkey is ranked first,
+     * Computes key-bit similarity: `correct_bits / 64`,
+     * Computes Hamming distance on the first 64 key bits: `64 − correct_bits`,
      * Saves a textual summary and plots.
-   * At the end, a global ranking file (`global_ranking.txt`) is written, sorting models by key-bit similarity.
-
+   * At the end, a global ranking file (`global_ranking.txt`) is written, sorting models primarily by SR, then GE, then key-bit similarity.
 ---
 
 ## Running locally
@@ -211,13 +216,15 @@ python run.py \
   Batch size for training and evaluation.
 
 * `--window-size`
-  Length of the SNR-selected window (number of samples).
+  Length of the SNR-selected window (number of samples).  
+  For each BitNum, the window is centered around the maximum of a **multi-class SNR** curve computed over the 8 subkey classes.
 
 * `--seed`
   Random seed for reproducibility (default: 1234).
 
 * `--device`
-  Override the device (e.g. `cpu` or `cuda`). If not set, it automatically uses `cuda` when available.
+  Override the device (e.g. `cpu`, `cuda`, or `xpu`). If not set, the script automatically prefers `cuda` (if available),
+  then `xpu` (if available), otherwise falls back to `cpu`.
 
 ---
 
@@ -257,7 +264,7 @@ Under `--output-dir`, the script creates the following layout:
 
   model_MLP/
     summary.txt
-    key_bits_true_vs_recovered.png
+    true_vs_recovered.png
     subkey_00/
       snr.png
       train_val_loss.png
@@ -279,11 +286,12 @@ For each model:
   Contains:
 
   * recovered subkeys (0..63),
+  * per-subkey rank of the correct 3-bit subkey and per-model GE/SR,
   * true key bytes (first 8),
-  * true vs recovered bit vectors,
-  * Hamming distance and similarity.
+  * true vs recovered bit vectors on the first 64 bits,
+  * Hamming distance and key-bit similarity.
 
-* `key_bits_true_vs_recovered.png`
+* `true_vs_recovered.png`
   Step plot comparing true and recovered key bits (0..63).
 
 * `subkey_xx/`

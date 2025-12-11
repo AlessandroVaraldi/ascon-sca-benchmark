@@ -112,10 +112,10 @@ class TCN(nn.Module):
         num_conv_layers: int = 3,
         kernel_size: int = 11,
         pool_size: int = 2,
-        dropout: float = 0.5,
-        use_input_avgpool: bool = True,
+        dropout: float = 0.3,
+        use_input_avgpool: bool = False,
         input_pool_kernel: int = 2,
-        tcn_depth: int = 3,
+        tcn_depth: int = 2,
         tcn_kernel_size: int = 5,
         tcn_dropout: float = 0.1,
     ):

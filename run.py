@@ -254,27 +254,12 @@ def reconstruct_key_bits_from_subkeys(
     bit_length: int = 64,
 ) -> np.ndarray:
     """
-    Reconstruct a 64-bit key from recovered 3-bit subkeys.
+    Baseline reconstruction of a 64-bit key from recovered 3-bit subkeys
+    using simple majority vote on the three occurrences of each bit.
 
-    For i < 64, ascon.select_subkey(i, key) builds:
-        sub_key[0] = key bit at position i
-        sub_key[1] = key bit at position (i + dr[reg_num_0][0]) % 64
-        sub_key[2] = key bit at position (i + dr[reg_num_0][1]) % 64
-
-    Therefore, each key bit j in [0..63] appears exactly 3 times:
-        - as sub_key[0] of subkey j
-        - as sub_key[1] of subkey (j - dr[reg_num_0][0]) % 64
-        - as sub_key[2] of subkey (j - dr[reg_num_0][1]) % 64
-
-    We decode the 3 bits for every recovered subkey and, for each key bit j,
-    perform a majority vote over the three occurrences to get the final bit.
-
-    Args:
-        recovered_subkeys: [num_bitnums], each in [0..7]
-        bit_length: number of key bits to reconstruct (<= num_bitnums)
-
-    Returns:
-        key_bits: [bit_length] array with bits in {0,1}
+    NOTE: this function is kept as a baseline. The main pipeline uses
+    probabilistic bit-level combination from full subkey log-likelihoods
+    (see reconstruct_key_bits_from_loglikelihoods).
     """
     num_bitnums = recovered_subkeys.shape[0]
     assert bit_length <= num_bitnums, "bit_length cannot exceed num_bitnums"
@@ -289,21 +274,103 @@ def reconstruct_key_bits_from_subkeys(
         b1[i] = (s >> 1) & 1
         b2[i] = s & 1
 
-    # Get the shifts used in select_subkey from ascon_helper
-    shift1, shift2 = ascon.dr[ascon.reg_num_0]   # e.g. (57, 23)
+    shift1, shift2 = ascon.dr[ascon.reg_num_0]
 
     key_bits = np.zeros(bit_length, dtype=np.int64)
     for j in range(bit_length):
-        # Occurrences of key bit j:
-        #   - b0[j]
-        #   - b1[(j - shift1) % 64]
-        #   - b2[(j - shift2) % 64]
         v0 = b0[j]
         v1 = b1[(j - shift1) % bit_length]
         v2 = b2[(j - shift2) % bit_length]
 
         votes_sum = v0 + v1 + v2
         key_bits[j] = 1 if votes_sum >= 2 else 0
+
+    return key_bits
+
+
+def reconstruct_key_bits_from_loglikelihoods(
+    log_likelihoods: np.ndarray,
+    bit_length: int = 64,
+) -> np.ndarray:
+    """
+    Probabilistic reconstruction of the first 64 key bits from subkey
+    log-likelihoods, combining information at bit level.
+
+    Args:
+        log_likelihoods: array of shape [num_bitnums, 8], where
+            log_likelihoods[i, s] is the aggregated log-likelihood (or
+            log-posterior up to a constant) for subkey i taking value
+            s in {0..7}.
+        bit_length: number of key bits to reconstruct (<= num_bitnums).
+
+    For i < 64, ascon.select_subkey(i, key) encodes
+        s(i) = (b0(i) << 2) | (b1(i) << 1) | b2(i)
+    where:
+        b0(i) = key bit at position i
+        b1(i) = key bit at position (i + shift1) % 64
+        b2(i) = key bit at position (i + shift2) % 64
+
+    Each key bit k_j therefore appears in three subkeys:
+        - as b0(j)      in S_j
+        - as b1(j)      in S_{(j - shift1) % 64}
+        - as b2(j)      in S_{(j - shift2) % 64}
+
+    For each bit k_j and each hypothesis b in {0,1}, we:
+        1) identify the three (subkey index, role) pairs that contain k_j,
+        2) for each pair (i, role), sum the likelihoods of all subkey
+           classes whose bit in that role equals b (log-sum-exp),
+        3) sum the three contributions to obtain log L(k_j = b),
+        4) decide k_j = argmax_b log L(k_j = b).
+    """
+    num_bitnums, num_classes = log_likelihoods.shape
+    assert num_classes == 8, "This reconstruction assumes 3-bit subkeys (8 classes)."
+    assert bit_length <= num_bitnums, "bit_length cannot exceed num_bitnums"
+
+    # Precompute decoding of classes into (b0,b1,b2)
+    b_table = np.zeros((num_classes, 3), dtype=np.int64)
+    for s in range(num_classes):
+        b_table[s, 0] = (s >> 2) & 1
+        b_table[s, 1] = (s >> 1) & 1
+        b_table[s, 2] = s & 1
+
+    # Precompute masks: mask[role][bit] -> boolean array over classes
+    masks = [[None, None], [None, None], [None, None]]  # 3 roles x 2 bit values
+    classes = np.arange(num_classes)
+    for role in range(3):
+        for bit in range(2):
+            masks[role][bit] = (b_table[:, role] == bit)
+
+    # Get the shifts used in select_subkey from ascon_helper
+    shift1, shift2 = ascon.dr[ascon.reg_num_0]   # e.g. (57, 23)
+
+    def logsumexp(arr: np.ndarray) -> float:
+        m = np.max(arr)
+        return float(m + np.log(np.sum(np.exp(arr - m) + 1e-300)))
+
+    key_bits = np.zeros(bit_length, dtype=np.int64)
+
+    for j in range(bit_length):
+        # Three occurrences of key bit j:
+        #   - role 0 in subkey i0 = j
+        #   - role 1 in subkey i1 = (j - shift1) % bit_length
+        #   - role 2 in subkey i2 = (j - shift2) % bit_length
+        i0, r0 = j, 0
+        i1, r1 = (j - shift1) % bit_length, 1
+        i2, r2 = (j - shift2) % bit_length, 2
+
+        logL = [0.0, 0.0]  # logL[0], logL[1]
+        for bit in (0, 1):
+            # For each hypothesis k_j = bit, aggregate contributions
+            # from the three subkeys that contain k_j.
+            total = 0.0
+            for (i, r) in ((i0, r0), (i1, r1), (i2, r2)):
+                # classes whose bit at role r equals 'bit'
+                mask = masks[r][bit]
+                total += logsumexp(log_likelihoods[i, mask])
+            logL[bit] = total
+
+        # Decide k_j = argmax_b log L(k_j = b)
+        key_bits[j] = 1 if logL[1] > logL[0] else 0
 
     return key_bits
 
@@ -398,7 +465,7 @@ def train_one_subkey(
     epochs: int = 50,
     lr: float = 1e-3,
     device: str = "cuda",
-) -> Tuple[int, int, float, List[float], List[float], List[float], List[float]]:
+) -> Tuple[int, int, float, List[float], List[float], List[float], List[float], np.ndarray]:
     """
     Train a single model on a single BitNum (3-bit subkey classification).
 
@@ -574,9 +641,19 @@ def train_one_subkey(
     rank_true = int(np.where(ranks == true_subkey)[0][0]) + 1
     sr = 1.0 if rank_true == 1 else 0.0
 
-    return best_recovered_subkey, rank_true, sr, train_losses, val_losses, train_accs, val_accs
-
-
+    # Return also the full log-likelihood vector for probabilistic
+    # bit-level combination in the reconstruction phase.
+    return (
+        best_recovered_subkey,
+        rank_true,
+        sr,
+        train_losses,
+        val_losses,
+        train_accs,
+        val_accs,
+        log_likelihoods.copy(),
+    )
+    
 
 # ---------------------------------------------------------------------------
 # Main orchestration
@@ -654,6 +731,9 @@ def main():
         recovered_subkeys_all = np.zeros(num_bitnums, dtype=np.int64)
         ranks_all = np.zeros(num_bitnums, dtype=np.int64)
         sr_all = np.zeros(num_bitnums, dtype=np.float64)
+        # log_likelihoods_all[i, s]: aggregated log-likelihood for
+        # subkey index i taking value s in {0..7}
+        log_likelihoods_all = np.zeros((num_bitnums, 8), dtype=np.float64)
 
         print(f"\n========== Model: {model_name_clean.upper()} ==========")
 
@@ -681,7 +761,16 @@ def main():
             X_fixed_win = traces_fixed[:, start:end]    # [N_fixed, W]
 
             # Train and attack
-            best_subkey, rank_true, sr, train_losses, val_losses, train_accs, val_accs = train_one_subkey(
+            (
+                best_subkey,
+                rank_true,
+                sr,
+                train_losses,
+                val_losses,
+                train_accs,
+                val_accs,
+                log_liks,
+            ) = train_one_subkey(
                 model_name=model_name_clean,
                 loss_type=args.loss_type,
                 traces_train=X_random_win,
@@ -699,15 +788,19 @@ def main():
             recovered_subkeys_all[bitnum] = best_subkey
             ranks_all[bitnum] = rank_true
             sr_all[bitnum] = sr
+            log_likelihoods_all[bitnum, :] = log_liks
             print(
                 f"[{model_name_clean.upper()}][BitNum {bitnum:02d}] "
                 f"Recovered subkey: {best_subkey} | rank_true: {rank_true} | SR: {sr:.1f}"
             )
 
         # ------------------------------------------------------------------
-        # Reconstruct key bits from recovered subkeys and compare
+        # Reconstruct key bits from subkey log-likelihoods and compare
         # ------------------------------------------------------------------
-        recovered_key_bits64 = reconstruct_key_bits_from_subkeys(recovered_subkeys_all, bit_length=64)
+        recovered_key_bits64 = reconstruct_key_bits_from_loglikelihoods(
+            log_likelihoods_all,
+            bit_length=64,
+        )
 
         # Similarity metrics  on key bits
         correct_bits = (recovered_key_bits64 == true_key_bits64).sum()
@@ -736,12 +829,30 @@ def main():
             f.write(f"Success Rate (fraction of subkeys with rank 1): {sr_model:.6f}\n\n")
             f.write(f"Recovered subkeys (0..63):\n{recovered_subkeys_all.tolist()}\n\n")
             f.write(f"Per-subkey ranks (1..8, true subkey rank):\n{ranks_all.tolist()}\n\n")
+            f.write("NOTE: key bits are reconstructed via probabilistic bit-level\n")
+            f.write("combination of subkey log-likelihoods (log-sum-exp over classes\n")
+            f.write("consistent with each bit hypothesis), not via simple majority\n")
+            f.write("vote on the 3-bit subkeys.\n\n")
             f.write(f"True key (first 8 bytes): {true_key_bytes_fixed[:8].tolist()}\n")
             f.write(f"True key bits[0..63]: {true_key_bits64.tolist()}\n")
             f.write(f"Recovered key bits[0..63]: {recovered_key_bits64.tolist()}\n")
             f.write(f"Correct bits: {correct_bits}/{total_bits}\n")
             f.write(f"Hamming distance: {hamming_distance}\n")
             f.write(f"Similarity: {similarity:.6f}\n")
+
+        # Per-subkey diagnostics: true subkey, recovered subkey, rank, SR
+        per_subkey_path = os.path.join(model_dir, "per_subkey_metrics.txt")
+        with open(per_subkey_path, "w") as f_diag:
+            f_diag.write("# BitNum  true_subkey  recovered_subkey  rank_true  SR\n")
+            for bitnum in range(num_bitnums):
+                true_subkey_b = int(subkeys_fixed[0, bitnum])
+                rec_subkey_b = int(recovered_subkeys_all[bitnum])
+                rank_b = int(ranks_all[bitnum])
+                sr_b = float(sr_all[bitnum])
+                f_diag.write(
+                    f"{bitnum:02d}  {true_subkey_b:1d}  {rec_subkey_b:1d}  "
+                    f"{rank_b:2d}  {sr_b:.1f}\n"
+                )
 
         # Plot true vs recovered bits
         plt.figure(figsize=(10, 3))
@@ -781,12 +892,31 @@ def main():
         ),
     )
 
+    # Per-model print + collect GE/SR for global diagnostics
+    all_ge = []
+    all_sr = []
+
     for rank, (model_name, res) in enumerate(ranking, start=1):
         sim = float(res["similarity"][0])
         hd = int(res["hamming_distance"][0])
         ge = float(res["ge"][0])
         sr = float(res["sr"][0])
-        print(f"{rank}. {model_name.upper():>12} - SR {sr:.4f}, GE {ge:.4f}, similarity {sim:.4f}, Hamming distance {hd}")
+
+        all_ge.append(ge)
+        all_sr.append(sr)
+
+        print(
+            f"{rank}. {model_name.upper():>12} - "
+            f"SR {sr:.4f}, GE {ge:.4f}, similarity {sim:.4f}, Hamming distance {hd}"
+        )
+
+    # Global diagnostic statistics across models
+    avg_sr = float(np.mean(all_sr)) if all_sr else float("nan")
+    avg_ge = float(np.mean(all_ge)) if all_ge else float("nan")
+
+    print("\n---------------- Global diagnostic statistics ----------------")
+    print(f"Average SR across models: {avg_sr:.4f}")
+    print(f"Average GE across models: {avg_ge:.4f}")
 
     # Save a global summary file with SR, GE and key-bit similarity
     global_summary_path = os.path.join(args.output_dir, "global_ranking.txt")
@@ -797,7 +927,14 @@ def main():
             hd = int(res["hamming_distance"][0])
             ge = float(res["ge"][0])
             sr = float(res["sr"][0])
-            f.write(f"{rank}. {model_name.upper():>12} - SR {sr:.6f}, GE {ge:.6f}, similarity {sim:.6f}, Hamming distance {hd}\n")
+            f.write(
+                f"{rank}. {model_name.upper():>12} - "
+                f"SR {sr:.6f}, GE {ge:.6f}, similarity {sim:.6f}, Hamming distance {hd}\n"
+            )
+
+        f.write("\nGlobal diagnostic statistics across models:\n")
+        f.write(f"Average SR: {avg_sr:.6f}\n")
+        f.write(f"Average GE: {avg_ge:.6f}\n")
 
 
 if __name__ == "__main__":
